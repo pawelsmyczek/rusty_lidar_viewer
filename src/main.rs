@@ -3,6 +3,9 @@ use serialport::{DataBits, FlowControl, Parity, SerialPort, StopBits, TTYPort};
 
 use serde::{Deserialize, Serialize};
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
 use std::time::Duration;
 use std::{thread};
 use std::io::{Read, Write};
@@ -28,7 +31,6 @@ fn new<'a>(payload: Vec<u8>) -> Frame {
     frame
 }
 
-
 impl Frame
 {
 
@@ -44,7 +46,14 @@ fn calculate_checksum(&self) -> Result<u8, ()>
             return Err(())
         }
     };
-    bytes.drain(5..13);
+    if self.size <= 7 // serializer adds 8 bytes of padding in certain cases ...
+    {
+        bytes.drain(5..(5 + 8));
+    }
+    else    // another magic done by serializer for some larger structures
+    {
+        bytes.drain(5..(5 + 2));
+    }
     let interesting_bytes = &bytes[3..bytes.len()-1]; // exclude header and checksum
     for byte in interesting_bytes
     {
@@ -70,19 +79,39 @@ fn as_bytes(&self) -> Result<Vec<u8>, ()>
 
 }
 
-fn read_frame(serial_port : &mut TTYPort, payload_size : u32) -> Result<Frame, ()>
+fn read_frame(serial_port : &mut TTYPort, payload_size : u16) -> Result<Frame, ()>
 {
     let mut frame = vec![0u8; (payload_size + 6) as usize];
 
     loop
     {
         serial_port.set_timeout(Duration::from_millis(130)).expect("Couldn't set a tiemout");
-        match serial_port.read(&mut frame)
+        match serial_port.read_exact(&mut frame)
         {
             Ok(_) =>
             {
-                let payload = frame.drain(5..(payload_size+5) as usize).collect();
-                return Ok(new(payload));
+                let frame_obj = new(frame[5..(payload_size+5) as usize].to_vec());
+
+                if frame_obj.header != &frame[0..3]
+                {
+                    println!("Failed to deserialize frame header"); return Err(())
+                }
+                let size : u16 = match bincode::deserialize(&frame[3..5])
+                {
+                    Ok(size) => size,
+                    Err(msg) => { println!("Failed to deserialize size of frame {}", msg); return Err(()) }
+                };
+                if size != payload_size
+                {
+                    println!("Failed to deserialize size of frame frame, size is not as expected ( {} )", payload_size); return Err(())
+                }
+                let checksum = frame[frame.len()-1];
+                if frame_obj.checksum != checksum
+                {
+                    println!("Failed to deserialize checksum, expected ( {} )", checksum); return Err(())
+                }
+
+                return Ok(frame_obj);
             },
             Err(msg) =>
             {
@@ -104,6 +133,13 @@ fn read_frame(serial_port : &mut TTYPort, payload_size : u32) -> Result<Frame, (
 
 fn main()
 {
+    let running = Arc::new(AtomicBool::new(true));
+    let r = running.clone();
+
+    ctrlc::set_handler(move || {
+        r.store(false, Ordering::SeqCst);
+    }).expect("Error setting Ctrl-C handler");
+
     let serial_port_builder = serialport::new("/dev/ttyUSB0", 3000000)
     .data_bits(DataBits::Eight)
     .parity(Parity::None)
@@ -134,6 +170,11 @@ fn main()
 
     let device_info_read = read_frame(&mut serial_port, 7).unwrap();
     println!("{:?}", device_info_read);
+
+    serial_port.flush().unwrap();
+
+    thread::sleep(Duration::from_secs(1));
+
     let start_3d = new(vec![0x08, 0x00]);
     match serial_port.write(&start_3d.as_bytes().unwrap())
     {
@@ -142,8 +183,33 @@ fn main()
     };
     thread::sleep(Duration::from_secs(1));
 
-    let frame_3d = read_frame(&mut serial_port, 14401).unwrap();
-    println!("{:?}", frame_3d);
+    while running.load(Ordering::SeqCst)
+    {
+        const point_cloud_3d_size : u16 = 160 * 60;
+        let frame_3d = match read_frame(&mut serial_port, ((point_cloud_3d_size*3)/2)+1)
+        {
+            Ok(frame_3d) => frame_3d,
+            Err(msg) => { println!("Failed to read frame : {:?}", msg); break; }
+        };
+        let mut point_cloud_3d = [0u16;point_cloud_3d_size as usize];
+        let mut iter_frame: usize = 0;
+        let mut iter_point_cloud: usize = 0;
+        while iter_point_cloud < point_cloud_3d_size as usize && iter_frame < frame_3d.payload.len()-3
+        {
+            let first = frame_3d.payload[iter_frame]; iter_frame+=1;
+            let second = frame_3d.payload[iter_frame]; iter_frame+=1;
+            let third = frame_3d.payload[iter_frame]; iter_frame+=1;
+
+            point_cloud_3d[iter_point_cloud] = first as u16;
+            point_cloud_3d[iter_point_cloud] |= ((second & 0xf) as u16) << 8;
+            iter_point_cloud+=1;
+
+            point_cloud_3d[iter_point_cloud] = ((second & 0xf) >> 4) as u16;
+            point_cloud_3d[iter_point_cloud] |= (third << 4) as u16;
+        }
+        thread::sleep(Duration::from_millis(20));
+        println!("Read frame, its point cloud is {:?}", point_cloud_3d);
+    }
 
     let stop = new(vec![0x02, 0x00, 0x00]);
     match serial_port.write(&stop.as_bytes().unwrap())
